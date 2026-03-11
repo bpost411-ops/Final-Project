@@ -1,0 +1,719 @@
+---
+title: "County Food Access Dashboard"
+author: "Breanna Post, Asmaa Elsayed, Nailah Gayle"
+date: today
+format:
+  dashboard:
+    theme:
+      - cosmo
+      - custom.scss
+    embed-resources: false
+    toc: false
+    code-fold: false
+    code-tools: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(scales)
+library(crosstalk)
+library(leaflet)
+library(DT)
+library(plotly)
+library(tigris)
+library(sf)
+
+food_path   <- "food_access (1).csv"
+codes_path  <- "CountyCodes (1).csv"
+places_path <- "PLACES__Local_Data_for_Better_Health,_County_Data,_2025_release_20260213.csv"
+
+food_access  <- readr::read_csv(food_path, show_col_types = FALSE)
+county_codes <- readr::read_csv(codes_path, show_col_types = FALSE)
+places_raw   <- readr::read_csv(places_path, show_col_types = FALSE)
+
+stats_food_access_year_info <- if ("Year" %in% names(food_access)) {
+  paste(sort(unique(food_access$Year)), collapse = ", ")
+} else {
+  "Not available as a single Year column (reference years vary by variable; see dataset documentation)."
+}
+
+stats_county_codes_year_info <- if ("Year" %in% names(county_codes)) {
+  paste(sort(unique(county_codes$Year)), collapse = ", ")
+} else {
+  "Not available as a single Year column."
+}
+
+state_lookup <- tibble(State = state.name, StateAbbr = state.abb)
+
+food_keyed <- food_access |>
+  left_join(state_lookup, by = "State") |>
+  left_join(
+    county_codes |>
+      transmute(
+        StateAbbr = State,
+        County    = County_name,
+        LocationID = stringr::str_pad(as.character(FIPStxt), width = 5, pad = "0"),
+        metro_status = `Metro-nonmetro status`
+      ),
+    by = c("StateAbbr", "County")
+  ) |>
+  mutate(
+    Population    = as.numeric(Population),
+    la_people_1mi = as.numeric(`Low Access Numbers.People.1 Mile`),
+    la_people_10mi = as.numeric(`Low Access Numbers.People.10 Miles`),
+    la_lowinc_1mi = as.numeric(`Low Access Numbers.Low Income People.1 Mile`),
+    la_lowinc_10mi = as.numeric(`Low Access Numbers.Low Income People.10 Miles`)
+  ) |>
+  mutate(
+    la_people_1mi = if_else(is.na(la_people_1mi) & !is.na(Population), 0, la_people_1mi),
+    la_people_10mi = if_else(is.na(la_people_10mi) & !is.na(Population), 0, la_people_10mi),
+    la_lowinc_1mi = if_else(is.na(la_lowinc_1mi) & !is.na(Population), 0, la_lowinc_1mi),
+    la_lowinc_10mi = if_else(is.na(la_lowinc_10mi) & !is.na(Population), 0, la_lowinc_10mi),
+    pct_low_access_1mi      = 100 * la_people_1mi / Population,
+    pct_low_access_10mi     = 100 * la_people_10mi / Population,
+    pct_low_access_lowinc_1mi  = 100 * la_lowinc_1mi / Population,
+    pct_low_access_lowinc_10mi = 100 * la_lowinc_10mi / Population
+  ) |>
+  mutate(
+    metro_status = dplyr::case_when(
+      metro_status %in% c(1, "1", "Metro", "metro") ~ "Metro",
+      metro_status %in% c(0, "0", "Nonmetro", "Non-metro", "nonmetro") ~ "Rural",
+      TRUE ~ as.character(metro_status)
+    ),
+    metro_status = factor(metro_status, levels = c("Metro", "Rural"))
+  )
+
+places_wide <- places_raw |>
+  filter(
+    Year == 2023,
+    MeasureId %in% c("OBESITY", "DIABETES"),
+    Data_Value_Type == "Crude prevalence"
+  ) |>
+  select(LocationID, MeasureId, Data_Value) |>
+  mutate(
+    LocationID = stringr::str_pad(as.character(LocationID), width = 5, pad = "0"),
+    Data_Value = as.numeric(Data_Value)
+  ) |>
+  tidyr::pivot_wider(names_from = MeasureId, values_from = Data_Value)
+
+joined_food <- food_keyed |>
+  left_join(places_wide, by = "LocationID") |>
+  mutate(
+    OBESITY  = as.numeric(OBESITY),
+    DIABETES = as.numeric(DIABETES),
+
+    #  (Metro uses 1 mile; Rural uses 10 miles)
+    pct_low_access_def = if_else(
+      metro_status == "Metro",
+      pct_low_access_1mi,
+      pct_low_access_10mi
+    ),
+
+    
+    food_desert = if_else(pct_low_access_def >= 33, "Food desert", "Not food desert")
+  )
+
+summary_metrics <- joined_food |>
+  summarize(
+    total_counties  = n(),
+    avg_low_access  = mean(pct_low_access_def, na.rm = TRUE),
+    avg_obesity     = mean(OBESITY, na.rm = TRUE),
+    avg_diabetes    = mean(DIABETES, na.rm = TRUE),
+    food_desert_count = sum(food_desert == "Food desert", na.rm = TRUE)
+  )
+
+top_low_access <- joined_food |>
+  filter(!is.na(pct_low_access_def)) |>
+  arrange(desc(pct_low_access_def)) |>
+  slice_head(n = 10) |>
+  mutate(rank = row_number())
+
+top_obesity <- joined_food |>
+  filter(!is.na(OBESITY)) |>
+  arrange(desc(OBESITY)) |>
+  slice_head(n = 10) |>
+  mutate(rank = row_number())
+
+top_diabetes <- joined_food |>
+  filter(!is.na(DIABETES)) |>
+  arrange(desc(DIABETES)) |>
+  slice_head(n = 10) |>
+  mutate(rank = row_number())
+
+desert_stats <- joined_food |>
+  group_by(food_desert) |>
+  summarize(
+    count             = n(),
+    avg_low_access    = mean(pct_low_access_def, na.rm = TRUE),
+    avg_obesity       = mean(OBESITY, na.rm = TRUE),
+    avg_diabetes      = mean(DIABETES, na.rm = TRUE)
+  )
+
+# Additional stats
+stats_corr_obesity <- cor(joined_food$pct_low_access_def, joined_food$OBESITY, use = "complete.obs")
+stats_corr_diabetes <- cor(joined_food$pct_low_access_def, joined_food$DIABETES, use = "complete.obs")
+
+stats_desert_means <- joined_food |>
+  group_by(food_desert) |>
+  summarize(
+    mean_obesity = mean(OBESITY, na.rm = TRUE),
+    mean_diabetes = mean(DIABETES, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_mean_obesity_desert <- stats_desert_means |>
+  filter(food_desert == "Food desert") |>
+  pull(mean_obesity)
+stats_mean_obesity_non_desert <- stats_desert_means |>
+  filter(food_desert == "Not food desert") |>
+  pull(mean_obesity)
+
+stats_mean_diabetes_desert <- stats_desert_means |>
+  filter(food_desert == "Food desert") |>
+  pull(mean_diabetes)
+stats_mean_diabetes_non_desert <- stats_desert_means |>
+  filter(food_desert == "Not food desert") |>
+  pull(mean_diabetes)
+
+stats_n_food_access_counties <- n_distinct(food_keyed$LocationID)
+stats_n_places_counties <- n_distinct(places_wide$LocationID)
+stats_n_county_codes_rows <- nrow(county_codes)
+
+sd_joined <- SharedData$new(joined_food, key = ~LocationID)
+
+options(tigris_use_cache = TRUE)
+county_shapes <- tigris::counties(cb = TRUE, year = 2023, class = "sf") |>
+  dplyr::rename(LocationID = GEOID) |>
+  left_join(joined_food, by = "LocationID")
+sd_county <- SharedData$new(county_shapes, group = sd_joined$groupName())
+
+pal_low_access <- colorNumeric("YlOrRd", domain = joined_food$pct_low_access_def, na.color = "transparent")
+pal_obesity    <- colorNumeric("Blues", domain = joined_food$OBESITY, na.color = "transparent")
+pal_diabetes   <- colorNumeric("Greens", domain = joined_food$DIABETES, na.color = "transparent")
+
+```
+
+# {.sidebar}
+
+Adjust the filters below to focus the dashboard on specific states or
+metro categories.
+
+```{r}
+filter_select("state", "State:", sd_joined, ~StateAbbr)
+filter_select("metro", "Metro/Rural:", sd_joined, ~metro_status)
+filter_slider("pct_low_access_def", "Low access %:", sd_joined, ~pct_low_access_def)
+```
+
+# Introduction
+
+## Row {height="65%"}
+
+### Column {width="50%"}
+
+::: {.card title="Topical overview" fill="true"}
+Food access refers to whether people can reasonably get to places that sell fresh and nutritious food, like grocery stores or supermarkets. When that access is limited, people may end up relying more on convenience stores or fast food, which usually have fewer healthy options. Over time, this can make it harder for individuals and families to maintain balanced diets and can contribute to long-term health problems. Because of this, public health researchers often include food access as part of the broader “social determinants of health,” meaning that the conditions where people live can influence health outcomes over time.
+
+Limited food access is sometimes described using the idea of a “food desert,” which generally refers to places where many residents live far from full grocery stores or affordable healthy food options. Public health organizations like the CDC have noted that communities with fewer healthy food options often experience higher rates of diet related conditions such as obesity and type 2 diabetes. These patterns are not only about food itself, but also about things like transportation, income levels, and how neighborhoods are developed. In other words, the physical environment people live in can shape the choices that are realistically available to them.
+
+In this project, we look at whether counties in the United States with higher levels of low food access also tend to have higher rates of obesity and diabetes. The goal isn’t to prove that one thing directly causes the other, but to see if there are patterns that show up when we compare the data. To explore these patterns, we combine two public data sets. County level low food access measures come from the [USDA Food Access Research Atlas](https://www.ers.usda.gov/data-products/food-access-research-atlas/). County level health outcomes (obesity and diabetes prevalence) come from the [CDC PLACES project](https://www.cdc.gov/places/).
+
+
+As background, the CDC discusses how food insecurity and limited access to nutritious food can contribute to poorer health outcomes and disparities across communities. See the [CDC overview of food insecurity and health](https://www.cdc.gov/diabetes/healthy-eating/diabetes-food-insecurity.html). County level patterns can help identify where barriers to healthy food and worse health outcomes overlap. These results can support communities in need and help guide where to look more closely with additional data to be able to target resources to these areas.
+
+![](USDA-Logo-.png){fig-alt="USDA Letters ontop of two green mounds" width="30%"}
+![](CDC-Symbol.png){fig-alt="CDC lettering with Safer, Healthier, People" width="30%"}
+
+:::
+
+### Column {width="50%"}
+
+::: {.card title="Grocery Store" padding="0px" fill="true"}
+![](intro_banner.jpg){fig-alt="Fruits and vegetables at a grocery store" width="90%"}
+:::
+
+## Row {height="35%"}
+
+### Column {width="33%"}
+
+::: {.card title="Big picture questions" fill="true"}
+**1. How does low food access vary across U.S. counties, and which counties are most extreme?**
+
+**2. Is higher low food access associated with higher obesity and diabetes prevalence?**
+
+**3. Where are high low food access counties located, and do patterns differ for Metro vs Rural counties?**
+:::
+
+### Column {width="33%"}
+
+::: {.card title="Methods/ Data Processing" fill="true"}
+We loaded three raw files: the USDA Food Access Research Atlas, a county codes crosswalk and the CDC PLACES 2023 release. In the USDA data we converted populations and low‑access counts to numeric, computed low‑access percentages at 1‑ and 10‑mile distances, and used the county codes to add a five‑digit FIPS code and metro/rural label. Missing low‑access counts were set to zero where population counts were present.
+
+Health outcomes. The PLACES file was filtered to Year 2023 (it was the most recent complete year) and to two measures (obesity and diabetes) at the “crude prevalence” level. We reshaped it so each county has one row with OBESITY and DIABETES columns and padded the county IDs to five digits for a consistent join key.
+
+Final join and derived metrics. The cleaned USDA table was left‑joined to the PLACES data by county FIPS. We then cast OBESITY and DIABETES to numeric, created a distance‑aware low‑access percentage (one‑mile for metro counties, ten‑mile for rural counties) and flagged counties as “food deserts” when ≥33 % of residents had low food access. This joined dataset underpins all summary statistics, plots and maps used in the dashboard.
+:::
+
+### Column {width="34%"}
+
+::: {.card title="Ethics and limitations" fill="true"}
+This is an ecological analysis: county averages cannot explain individual behavior and do not prove causality. PLACES values are modeled estimates and include uncertainty. Our low food access percentages depend on how “low food access” is defined and may not capture within-county disparities. Where low food access counts were missing but population was present, we set counts to 0 so percentages could be computed; this decision may underestimate low food access in a small number of counties.
+:::
+
+
+# Data Context
+
+## Row {height="20%"}
+
+```{r}
+#| content: valuebox
+#| title: "Food access counties"
+#| icon: database
+#| color: primary
+stats_n_food_access_counties
+```
+
+```{r}
+#| content: valuebox
+#| title: "PLACES counties (2023)"
+#| icon: clipboard2-pulse
+#| color: info
+stats_n_places_counties
+```
+
+```{r}
+#| content: valuebox
+#| title: "Counties after join"
+#| icon: link-45deg
+#| color: success
+joined_food |> summarize(n = n_distinct(LocationID)) |> pull(n)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Crosswalk rows"
+#| icon: table
+#| color: warning
+stats_n_county_codes_rows
+```
+
+## Row {height="65%"}
+
+### Column {.tabset width="60%"}
+
+::: {.card title="Overview" fill="true"}
+This dashboard joins county-level food access measures with county-level health outcomes to explore how limited access to nutritious food may relate to obesity and diabetes prevalence. The unit of analysis is the U.S. county, joined by a five-digit FIPS code (`LocationID`).
+:::
+
+::: {.card title="Dataset 1: USDA Food Access Research Atlas" fill="true"}
+The USDA Food Access Research Atlas is produced by the U.S. Department of Agriculture’s Economic Research Service (USDA ERS) and is publicly available online: [Food Access Research Atlas](https://www.ers.usda.gov/data-products/food-access-research-atlas/). Our county-level file includes total population plus counts of residents with “low food access” at multiple distance thresholds (notably 1 mile and 10 miles). After cleaning and attaching five-digit FIPS codes, we retain `r stats_n_food_access_counties` counties for analysis. The year information available in this file is `r stats_food_access_year_info`. A key limitation is that county-level averages can hide neighborhood-level access differences, and distance-based access does not capture affordability or transportation.
+:::
+
+::: {.card title="Dataset 2: CDC PLACES" fill="true"}
+CDC PLACES is produced by the Centers for Disease Control and Prevention (CDC) and provides small-area health estimates for U.S. counties and other geographies: [CDC PLACES](https://www.cdc.gov/places/). In this dashboard, we use 2023 county-level crude prevalence estimates for obesity and diabetes. After filtering to the two measures and pivoting to a county-wide format, we observe `r stats_n_places_counties` counties with values that can be joined to the food access data. A strength of PLACES is consistent measurement definitions across the U.S.; a limitation is that these are modeled estimates rather than direct measurement for every resident.
+:::
+
+::: {.card title="Dataset 3: County codes crosswalk" fill="true"}
+To join county-level datasets reliably, we use a county codes crosswalk that includes county names, five-digit FIPS codes, and a Metro vs non-metro indicator. In our project, the crosswalk contains `r stats_n_county_codes_rows` rows and helps standardize identifiers when naming conventions differ across sources. The year information available in this file is `r stats_county_codes_year_info`. A limitation is that metro classifications can vary by definition and year; for transparency, we treat the indicator as a simplified Metro vs Rural label in this dashboard.
+:::
+
+### Column {width="40%"}
+
+::: {.card title="Join key and key variables" fill="true"}
+We join datasets using a five-digit county FIPS code (`LocationID`). Key variables include:
+
+* `pct_low_access_def`: percent of the county population with low food access 
+* `pct_low_access_10mi`: percent of the county population with low food access at the 10-mile threshold 
+* * `pct_low_access_1mi`: percent of the county population with low food access at the 1-mile threshold 
+* `OBESITY`, `DIABETES`: county-level prevalence estimates from CDC PLACES 
+* `metro_status`: simplified Metro vs Rural label derived from the county codes file
+* `food_desert`: indicator for counties meeting a ≥33% low food access threshold 
+
+These variables power the filters, plots, and maps across the dashboard. If you interpret “food desert” differently for rural counties (often using longer distance thresholds), results will change.
+:::
+
+## Row {height="15%" .flow}
+
+::: {.card title="Note on interpretation"}
+All measures here are **county-level**. This is useful for comparing counties and identifying broad patterns, but it cannot explain individual behavior or prove causality. PLACES outcomes are modeled estimates, and “low food access” depends on distance thresholds and measurement choices.
+:::
+
+
+# Question 1: Variation
+
+**Question 1:** How does low food access vary across U.S. counties?
+
+This page summarizes nationwide patterns and highlights counties with extreme values. Use the tabs to compare top counties across outcomes and use the sidebar to focus on subsets.
+
+## Row {height="25%"}
+
+```{r}
+#| content: valuebox
+#| title: "Total Counties"
+#| icon: geo-alt
+#| color: primary
+summary_metrics$total_counties
+```
+
+```{r}
+#| content: valuebox
+#| title: "Avg Low Food Access Rate"
+#| icon: signpost
+#| color: info
+paste0(round(summary_metrics$avg_low_access, 1), "%")
+```
+
+```{r}
+#| content: valuebox
+#| title: "Avg Obesity Rate"
+#| icon: heart-pulse
+#| color: success
+paste0(round(summary_metrics$avg_obesity, 1), "%")
+```
+
+```{r}
+#| content: valuebox
+#| title: "Avg Diabetes Rate"
+#| icon: people-fill
+#| color: warning
+paste0(round(summary_metrics$avg_diabetes, 1), "%")
+```
+
+```{r}
+#| content: valuebox
+#| title: "Food Desert Counties"
+#| icon: exclamation-triangle
+#| color: danger
+summary_metrics$food_desert_count
+```
+
+## Row {height="55%"}
+
+### Column {.tabset width="50%"}
+
+```{r}
+#| title: "Top Low Food Access Counties"
+#| caption: "Top 10 counties by percent low food access. Use the sidebar to filter by state or Metro/Rural." 
+#| message: false
+#| warning: false
+top_low_access |>
+  ggplot(aes(x = fct_reorder(County, pct_low_access_def), y = pct_low_access_def, fill = StateAbbr)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Low Food Access %", fill = "State") +
+  theme_minimal()
+```
+
+```{r}
+#| title: "Top Obesity Counties"
+#| caption: "Top 10 counties by obesity prevalence (CDC PLACES, 2023)." 
+#| message: false
+#| warning: false
+top_obesity |>
+  ggplot(aes(x = fct_reorder(County, OBESITY), y = OBESITY, fill = StateAbbr)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Obesity prevalence (%)", fill = "State") +
+  theme_minimal()
+```
+
+```{r}
+#| title: "Top Diabetes Counties"
+#| caption: "Top 10 counties by diabetes prevalence (CDC PLACES, 2023)." 
+#| message: false
+#| warning: false
+top_diabetes |>
+  ggplot(aes(x = fct_reorder(County, DIABETES), y = DIABETES, fill = StateAbbr)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Diabetes prevalence (%)", fill = "State") +
+  theme_minimal()
+```
+
+### Column
+
+```{r}
+#| title: "Distribution of Low Food Access"
+#| caption: "Histogram of county low food access percentages." 
+#| message: false
+#| warning: false
+plotly::plot_ly(
+  data = sd_joined,
+  x    = ~pct_low_access_def,
+  type = "histogram",
+  nbinsx = 30
+) %>%
+  layout(xaxis = list(title = "low food access %"),
+         yaxis = list(title = "Number of counties"))
+```
+
+```{r}
+#| title: "Distribution of Obesity Prevalence"
+#| caption: "Histogram of county obesity prevalence estimates (CDC PLACES, 2023)." 
+#| message: false
+#| warning: false
+plotly::plot_ly(
+  data = sd_joined,
+  x    = ~OBESITY,
+  type = "histogram",
+  nbinsx = 30
+) %>%
+  layout(xaxis = list(title = "Obesity prevalence (%)"),
+         yaxis = list(title = "Number of counties"))
+```
+
+## Row {.flow height="20%"}
+
+::: {.card title="Overview"}
+This dashboard follows a USDA-style “low food access” approach: we calculate the percent of each county’s population that is classified as having low food access to food.
+
+We label a county as a **food desert** if at least 33% of its population is low food access. This is a simplified definition used for exploration.
+:::
+
+::: {.card title="Answer"}
+Counties with a higher low food access percentage often have
+small populations and are typically rural. The histograms reveal a skewed distribution for both low food access and obesity. Use the sidebar to explore by state and Metro/Rural status.
+
+:::
+
+
+# Question 2: Associations
+
+**Question 2:** Is low food access associated with higher obesity and diabetes prevalence?
+
+This page examines relationships between food access and health outcomes and compares averages by food desert status.
+## Row {height="70%"}
+
+### Column {width="50%"}
+
+```{r}
+#| title: "low food access vs Obesity"
+#| caption: "Each point is a county. The smooth curve summarizes the overall trend; color indicates Metro vs Rural." 
+#| message: false
+#| warning: false
+p1 <- ggplot(sd_joined, aes(x = pct_low_access_def, y = OBESITY, colour = metro_status)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, colour = "black") +
+  labs(x = "low food access %", y = "Obesity prevalence (%)", colour = "Metro/Rural")
+plotly::ggplotly(p1)
+```
+
+```{r}
+#| title: "low food access vs Diabetes"
+#| caption: "Each point is a county. The smooth curve summarizes the overall trend; color indicates Metro vs Rural." 
+#| message: false
+#| warning: false
+p2 <- ggplot(sd_joined, aes(x = pct_low_access_def, y = DIABETES, colour = metro_status)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, colour = "black") +
+  labs(x = "low food access %", y = "Diabetes prevalence (%)", colour = "Metro/Rural")
+plotly::ggplotly(p2)
+```
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Food Desert Summary"
+#| caption: "Average low food access, obesity, and diabetes grouped by food desert indicator." 
+#| message: false
+#| warning: false
+desert_stats |>
+  mutate(
+    avg_low_access = round(avg_low_access, 1),
+    avg_obesity    = round(avg_obesity, 1),
+    avg_diabetes   = round(avg_diabetes, 1)
+  ) |>
+  datatable(
+    options = list(pageLength = 2, dom = 't'),
+    colnames = c("Food desert status", "Count", "Avg low food access %", "Avg obesity %", "Avg diabetes %")
+  )
+```
+
+```{r}
+#| title: "Top Food Desert Counties"
+#| caption: "Among food desert counties, these have the highest obesity prevalence." 
+#| message: false
+#| warning: false
+joined_food |>
+  filter(food_desert == "Food desert") |>
+  arrange(desc(OBESITY)) |>
+  slice_head(n = 10) |>
+  mutate(rank = row_number()) |>
+  ggplot(aes(x = fct_reorder(County, OBESITY), y = OBESITY, fill = StateAbbr)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "Obesity prevalence (%)", fill = "State") +
+  theme_minimal()
+```
+
+## Row {height="30%"}
+
+### Column {width="100%"}
+
+::: {.card title="Answer"}
+The scatter plots on the left show modest positive relationships
+between low food access and both obesity and diabetes.  Metropolitan
+counties tend to cluster towards lower low‑access percentages with
+moderate health outcomes, whereas rural counties exhibit greater
+variability.  The summary table compares averages by food desert
+status: food deserts have higher average low‑access shares and worse
+health outcomes.  The bar chart highlights the food desert counties
+with the highest obesity rates.
+:::
+
+
+# Question 3: Geography
+
+**Question 3:** Where are low food access counties located geographically?
+
+Explore spatial patterns of food access and health outcomes.
+
+## Row {.flow height="20%"}
+
+::: {.card title="How to read this map"}
+Darker shading indicates a higher percentage of the county population is classified as low food access. Hover over a county to see low food access, obesity, and diabetes values. Use the sidebar filters to focus on a state or compare Metro vs Rural counties.
+:::
+
+::: {.card title="Answer"}
+This is a county level view. Large counties can contain both well served and underserved areas, so the map can hide within county differences. Though you can see in Southern States there tends to be more food desert than in Northern States. States with more rural areas tends to have higher rates of low food access. 
+:::
+
+## Row {height="80%"}
+
+```{r}
+#| title: "low food access by County"
+#| caption: "Choropleth map of county low food access percentage. Use the sidebar filters to focus on Metro vs Rural patterns." 
+#| message: false
+#| warning: false
+leaflet(sd_county) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor  = ~pal_low_access(pct_low_access_def),
+    color      = "#444444", weight = 0.3,
+    opacity    = 1, fillOpacity = 0.7,
+    label      = ~paste0(
+      County, ", ", StateAbbr,
+      "<br><strong>low food access:</strong> ", round(pct_low_access_def,1), " %",
+      "<br><strong>Obesity:</strong> ", round(OBESITY,1), " %",
+      "<br><strong>Diabetes:</strong> ", round(DIABETES,1), " %"
+    ),
+    highlightOptions = highlightOptions(weight = 1.5, color = "#666", fillOpacity = 0.9, bringToFront = TRUE)
+  ) %>%
+  addLegend(pal = pal_low_access, values = joined_food$pct_low_access_def, title = "low food access (%)")
+```
+
+
+# Data Explorer
+
+## Row {.flow height="20%"}
+
+::: {.card title="Using the table"}
+This table allows you to search and sort counties. Sidebar filters apply here, so you can narrow to a single state or compare Metro vs Rural counties.
+:::
+
+::: {.card title="Common columns"}
+`pct_low_access_def` is the percent of the county population with low food access at the USDA threshold. `OBESITY` and `DIABETES` are prevalence estimates for 2023. `food_desert` flags counties at or above the 33% low food access threshold.
+:::
+
+## Row {height="80%"}
+
+```{r}
+#| title: "County Table"
+#| message: false
+#| warning: false
+datatable(
+  sd_joined,
+  options = list(pageLength = 20, scrollX = TRUE),
+  width = "100%"
+)
+```
+
+
+# Conclusion
+
+## Row {.fill}
+
+::: {.card title="Major takeaways"}
+Across U.S. counties, higher low food access is modestly associated with worse health outcomes. In our joined county dataset, counties with higher low food access percentages tend to have higher obesity and diabetes prevalence. This pattern is not strong enough to imply causation, but it does suggest that counties facing access barriers often overlap with counties experiencing higher chronic disease burden.
+
+When we compare counties by our food desert indicator (≥33% low food access using a distance aware definition: 1 mile for metro counties and 10 miles for rural counties), food desert counties have higher average obesity and diabetes prevalence than non food desert counties. The difference aligns with what we see in the scatterplots: metro counties generally cluster at lower low-access values, while rural counties show more spread and include many of the highest low food access counties.
+
+These results should be interpreted as county-level patterns rather than individual level effects. Our estimates may underestimate low food access in a small number of counties because missing low food access counts were set to 0 when population was present, and PLACES outcomes are modeled estimates with uncertainty that is not shown directly in the plots. Future work could incorporate the USDA low income + low food access definition, add socioeconomic variables (poverty, vehicle access, transportation), and move to smaller geographies (like census tracts) to better capture within-county differences and to test whether food access remains associated with outcomes after controlling for confounders.
+:::
+
+::: {.card title="Bias, uncertainty, and representativeness"}
+This dashboard may underestimate within-county disparities because counties can contain both well-served and undeserved neighborhoods. PLACES outcomes are modeled estimates, which introduces uncertainty that is not shown directly in these plots. Our decision to set missing low food access counts to 0 (when population was present) may also bias low food access percentages downward in a small number of counties.
+:::
+
+::: {.card title="Future directions"}
+Future work could incorporate a definition of low food access that varies by Metro vs Rural counties (for example, using a larger distance threshold in rural areas). Adding socioeconomic variables (poverty rate, vehicle access, broadband access) could help separate food access effects from correlated structural factors. A next step would be to fit a regression model that controls for these confounders and to explore sub county geographies (census tracts) where data are available.
+:::
+
+
+# Group Information
+
+## Row {height="10%"}
+
+### Column {width="100%"}
+::: card
+::: card-header
+Group topic
+:::
+::: card-body
+Our group explored how limited access to nutritious food and groceries stores at the county level has a correlation to chronic health outcomes such as obesity and diabetes and how patterns can differ for Metro and Rural counties.
+:::
+:::
+
+## Row {height="75%"}
+
+### Column {width="45%"}
+::: card
+::: card-header
+Coding notes and Data Sources
+:::
+::: card-body
+Below are tools we used:
+
+* `crosstalk::SharedData`, `filter_select()`, `filter_slider()` — links filters to multiple views (plots, tables, maps) without a server. Without Crosstalk we would need separate filtered datasets for each plot and no shared interactivity. We learned this from Quarto dashboard examples and Crosstalk documentation.
+* `leaflet` — builds interactive web maps with hover labels and zoom. A static map would not allow county-by-county exploration. We learned this from Leaflet for R tutorials and Quarto examples.
+* `tigris::counties()` and `sf` — downloads and handles county boundary geometries so we can draw a choropleth with political boundaries. Without these tools we would need to manually source and manage shapefiles. We learned this from the tigris documentation and examples.
+* `cor()` - I used this to compute the correlation which I learned in my info 180 class
+
+Below are the data Sources we used:
+
+* USDA ERS Food Access Research Atlas: [https://www.ers.usda.gov/data-products/food-access-research-atlas/](https://www.ers.usda.gov/data-products/food-access-research-atlas/)
+* CDC PLACES: [https://www.cdc.gov/places/](https://www.cdc.gov/places/)
+
+Datasets are joined using a five-digit county FIPS code (`LocationID`). low food access is defined as the percentage of the county population classified as low food access at the USDA threshold in the USDA data. Food desert counties meet or exceed the 33% low food access threshold.
+:::
+:::
+
+### Column {width="55%"}
+::: card
+::: card-header
+Group members
+:::
+::: card-body
+**Breanna Post** (University of Washington; bpost411@uw.edu) is interested in how structural barriers like food access relate to adverse health outcomes and how data can support targeted public policy.
+
+**Asmaa Elsayed** (University of Washington Information School; asmaael@uw.edu) is interested in food accessibility and health equity and focuses on visual storytelling and data visualization for public understanding.
+
+**Nailah Gayle** (University of Washington; ngayle9@uw.edu) is interested in how communication and information systems can widen access to resources across regions and support community solutions.
+
+![Team photo from a Zoom work session](Group_photo.png){fig-alt="Breanna, Asmaa, and Nailah on a zoom call"width="100%"}
+:::
+:::
+
+## Row {height="15%"}
+
+### Column {width="100%"}
+::: card
+::: card-header
+AI statement
+:::
+::: card-body
+We used AI for help troubleshooting Quarto dashboard layout issues (rows/columns), debugging Crosstalk filtering, and implementing an interactive county map. All data cleaning decisions, definitions, and interpretation of results were made by the team.
+:::
+:::
